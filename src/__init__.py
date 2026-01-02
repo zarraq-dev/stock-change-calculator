@@ -1,0 +1,1 @@
+# Stock Change Calculator package
