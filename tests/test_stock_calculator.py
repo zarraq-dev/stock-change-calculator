@@ -109,6 +109,7 @@ Apple Inc,AAPL,,
 ,,,
 Stocks,,,
 Name,Ticker,ISIN,
+,,,
 """
         from src.stock_calculator import parse_csv_file, CsvParsingError
 
@@ -684,7 +685,9 @@ class TestStockDataFetching:
         mock_ticker: Mock = Mock()
         mock_history: Mock = Mock()
         mock_history.empty = False
-        mock_history.__getitem__ = Mock(return_value=Mock(__getitem__=Mock(return_value=150.25)))
+        mock_close_series: Mock = Mock()
+        mock_close_series.iloc.__getitem__ = Mock(return_value=150.25)
+        mock_history.__getitem__ = Mock(return_value=mock_close_series)
         mock_ticker.history.return_value = mock_history
         mock_ticker_class.return_value = mock_ticker
 
