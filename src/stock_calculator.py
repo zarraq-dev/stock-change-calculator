@@ -33,9 +33,11 @@ DEPENDENCIES
 
 import argparse
 import csv
+import math
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -68,8 +70,34 @@ class StockDelistedError(Exception):
 
 DATE_FORMAT: str = "%d-%b-%y"  # Format for date parsing (e.g., 01-Jan-25)
 DATE_PATTERN: str = r"^\d{2}-[A-Za-z]{3}-\d{2}$"  # Regex pattern for date validation
-OPENFIGI_URL: str = "https://api.openfigi.com/v3/mapping"  # OpenFIGI API endpoint
+OPENFIGI_MAPPING_URL: str = "https://api.openfigi.com/v3/mapping"  # OpenFIGI mapping API endpoint (for ISIN lookups)
+OPENFIGI_SEARCH_URL: str = "https://api.openfigi.com/v3/search"  # OpenFIGI search API endpoint (for name lookups)
 DEFAULT_OUTPUT_FILENAME: str = "stock_changes_output.csv"  # Default output file name
+OPENFIGI_BATCH_SIZE: int = 10  # Maximum jobs per OpenFIGI mapping API request (anonymous limit)
+OPENFIGI_MAPPING_DELAY_SECONDS: float = 2.5  # Delay between Mapping API requests (25 req/min limit)
+OPENFIGI_SEARCH_DELAY_SECONDS: float = 13.0  # Delay between Search API requests (5 req/min limit, +1s buffer)
+
+# Valid security types for filtering OpenFIGI results
+LIST_S_VALID_SECURITY_TYPES: List[str] = [
+    "Common Stock",  # Standard equities
+    "REIT",  # Real Estate Investment Trusts
+    "ETP",  # Exchange Traded Products (covers ETFs)
+]
+
+# Exchange priority order for result selection (UK first, US second, rest alphabetically)
+LIST_S_EXCHANGE_PRIORITY: List[str] = [
+    "LN",  # London Stock Exchange (UK)
+    "US",  # US exchanges (generic)
+    "UN",  # NYSE
+    "UQ",  # NASDAQ
+    "UM",  # US mutual funds
+    "CN",  # Canada (Toronto)
+    "CT",  # Canada (TSX Venture)
+    "GF",  # Germany (Frankfurt)
+    "GR",  # Germany (XETRA)
+    "GY",  # Germany (generic)
+    "NA",  # Netherlands (Amsterdam/Euronext)
+]
 
 # Exchange code to yfinance suffix mapping
 DICT_EXCHANGE_SUFFIX: Dict[str, str] = {
@@ -257,11 +285,33 @@ def calculate_percentage_change(n_start_price: float, n_end_price: float) -> flo
     return n_percentage
 
 
+# Ticker Sanitisation Functions
+
+def sanitise_ticker(s_ticker_raw: str) -> str:
+    """
+    Sanitise a ticker symbol by removing invalid characters.
+
+    OpenFIGI sometimes returns tickers with trailing slashes (e.g., "NG/")
+    which are invalid for yfinance lookups. This function strips such characters.
+
+    Args:
+        s_ticker_raw: Raw ticker symbol from API.
+
+    Returns:
+        Sanitised ticker symbol with trailing slashes removed.
+    """
+    s_ticker_sanitised: str = s_ticker_raw.rstrip("/")  # Remove trailing slashes
+
+    return s_ticker_sanitised
+
+
 # OpenFIGI Lookup Functions
 
 def lookup_ticker_from_openfigi(s_stock_name: str = "", s_isin: str = "") -> Dict[str, Any]:
     """
     Look up stock ticker using Bloomberg OpenFIGI API.
+
+    Uses the Mapping API for ISIN lookups and the Search API for name lookups.
 
     Args:
         s_stock_name: Company name to search. Required if s_isin not provided.
@@ -280,41 +330,505 @@ def lookup_ticker_from_openfigi(s_stock_name: str = "", s_isin: str = "") -> Dic
     if not s_stock_name and not s_isin:
         raise ValueError("Either s_stock_name or s_isin must be provided to lookup_ticker_from_openfigi()")
 
-    list_dict_api_query: List[Dict[str, str]] = []  # Query payload for OpenFIGI API
-
-    if s_isin:
-        dict_query: Dict[str, str] = {"idType": "ID_ISIN", "idValue": s_isin}
-        list_dict_api_query.append(dict_query)
-    else:
-        dict_query: Dict[str, str] = {"idType": "NAME", "idValue": s_stock_name}
-        list_dict_api_query.append(dict_query)
-
     dict_headers: Dict[str, str] = {"Content-Type": "application/json"}  # HTTP request headers
 
+    if s_isin:
+        # Use Mapping API for ISIN lookup
+        list_dict_api_query: List[Dict[str, str]] = [{"idType": "ID_ISIN", "idValue": s_isin}]
+
+        try:
+            response_api = requests.post(OPENFIGI_MAPPING_URL, json=list_dict_api_query, headers=dict_headers, timeout=30)
+        except Exception as e:
+            raise ApiError(f"OpenFIGI API unreachable. Error: {str(e)}")
+
+        if response_api.status_code == 429:
+            raise ApiError("OpenFIGI API rate limit exceeded. Too many requests. Please wait a few minutes and try again.")
+
+        if response_api.status_code != 200:
+            raise ApiError(f"OpenFIGI API returned error status: {response_api.status_code}")
+
+        list_dict_response: List[Dict[str, Any]] = response_api.json()  # API response data
+
+        # Check for no match
+        if not list_dict_response or "warning" in list_dict_response[0] or "error" in list_dict_response[0]:
+            return {"s_ticker": "", "s_exchange_code": "", "b_not_found": True}
+
+        # Extract data from response
+        if "data" not in list_dict_response[0] or len(list_dict_response[0]["data"]) == 0:
+            return {"s_ticker": "", "s_exchange_code": "", "b_not_found": True}
+
+        dict_first_result: Dict[str, Any] = list_dict_response[0]["data"][0]  # First matching result
+
+        s_ticker_raw: str = dict_first_result.get("ticker", "")  # Raw ticker symbol from API
+        s_ticker: str = sanitise_ticker(s_ticker_raw)  # Sanitised ticker symbol
+        s_exchange_code: str = dict_first_result.get("exchCode", "")  # Exchange code
+
+        return {"s_ticker": s_ticker, "s_exchange_code": s_exchange_code, "b_not_found": False}
+
+    # Use Search API for name lookup
+    dict_query: Dict[str, str] = {"query": s_stock_name}
+
     try:
-        response_api = requests.post(OPENFIGI_URL, json=list_dict_api_query, headers=dict_headers, timeout=30)
+        response_api = requests.post(OPENFIGI_SEARCH_URL, json=dict_query, headers=dict_headers, timeout=30)
     except Exception as e:
         raise ApiError(f"OpenFIGI API unreachable. Error: {str(e)}")
+
+    if response_api.status_code == 429:
+        raise ApiError("OpenFIGI API rate limit exceeded. Too many requests. Please wait a few minutes and try again.")
 
     if response_api.status_code != 200:
         raise ApiError(f"OpenFIGI API returned error status: {response_api.status_code}")
 
-    list_dict_response: List[Dict[str, Any]] = response_api.json()  # API response data
+    dict_response: Dict[str, Any] = response_api.json()  # API response data
 
     # Check for no match
-    if not list_dict_response or "warning" in list_dict_response[0]:
+    if "data" not in dict_response or len(dict_response.get("data", [])) == 0:
         return {"s_ticker": "", "s_exchange_code": "", "b_not_found": True}
 
-    # Extract data from response - check if "data" key exists and has items
-    if "data" not in list_dict_response[0] or len(list_dict_response[0]["data"]) == 0:
-        return {"s_ticker": "", "s_exchange_code": "", "b_not_found": True}
+    dict_first_result: Dict[str, Any] = dict_response["data"][0]  # First matching result
 
-    dict_first_result: Dict[str, Any] = list_dict_response[0]["data"][0]  # First matching result
-
-    s_ticker: str = dict_first_result.get("ticker", "")  # Ticker symbol
+    s_ticker_raw: str = dict_first_result.get("ticker", "")  # Raw ticker symbol from API
+    s_ticker: str = sanitise_ticker(s_ticker_raw)  # Sanitised ticker symbol
     s_exchange_code: str = dict_first_result.get("exchCode", "")  # Exchange code
 
     return {"s_ticker": s_ticker, "s_exchange_code": s_exchange_code, "b_not_found": False}
+
+
+def select_and_validate_best_result(
+    list_dict_api_results: List[Dict[str, Any]],
+    s_search_query: str,
+    s_start_date: str,
+    s_end_date: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Select the best result from OpenFIGI Search API and validate it exists in yfinance.
+
+    Uses AND filter logic with exchange priority ordering:
+    1. Loop through exchanges in priority order (UK first, US second, rest alphabetically)
+    2. For each exchange, loop through all results
+    3. When a result matches ALL filter conditions:
+       - Security type is valid (Common Stock, REIT, or ETP)
+       - Exchange code matches current priority exchange
+       - Search query appears in the result name
+    4. Validate the ticker exists in yfinance by fetching price data
+    5. If valid, return the result with cached prices
+    6. If invalid, continue to next exchange in priority order
+
+    Args:
+        list_dict_api_results: List of result dictionaries from OpenFIGI Search API.
+        s_search_query: Original search query string (used for name matching).
+        s_start_date: Start date string in dd-mmm-yy format (for price validation).
+        s_end_date: End date string in dd-mmm-yy format (for price validation).
+
+    Returns:
+        Dictionary containing API result fields plus cached prices, or None if no valid result found.
+        If valid, includes: ticker, exchCode, name, s_full_ticker, n_start_price, n_end_price, s_currency
+    """
+    s_search_query_lowercase: str = s_search_query.lower()  # Lowercase search query for case-insensitive matching
+
+    # Loop through exchanges in priority order
+    for s_priority_exchange_code in LIST_S_EXCHANGE_PRIORITY:
+        # Loop through all API results for current exchange
+        for dict_api_result in list_dict_api_results:
+            s_security_type: str = dict_api_result.get("securityType", "")  # Primary security type
+            s_security_type2: str = dict_api_result.get("securityType2", "")  # Secondary security type
+            s_exchange_code: str = dict_api_result.get("exchCode", "")  # Exchange code
+            s_result_name: str = dict_api_result.get("name", "")  # Result name
+            s_result_name_lowercase: str = s_result_name.lower()  # Lowercase name for matching
+
+            # Check ALL filter conditions (AND logic)
+            b_has_valid_security_type: bool = (
+                s_security_type in LIST_S_VALID_SECURITY_TYPES or
+                s_security_type2 in LIST_S_VALID_SECURITY_TYPES
+            )  # True if security type is valid
+            b_matches_priority_exchange: bool = (s_exchange_code == s_priority_exchange_code)  # True if exchange matches current priority
+            b_query_in_name: bool = (s_search_query_lowercase in s_result_name_lowercase)  # True if query appears in name
+
+            if b_has_valid_security_type and b_matches_priority_exchange and b_query_in_name:
+                # Build full ticker with exchange suffix
+                s_ticker_raw: str = dict_api_result.get("ticker", "")  # Raw ticker from API
+                s_ticker_sanitised: str = sanitise_ticker(s_ticker_raw)  # Sanitised ticker
+                s_exchange_suffix: str = map_exchange_to_suffix(s_exchange_code)  # Exchange suffix for yfinance
+                s_full_ticker: str = s_ticker_sanitised + s_exchange_suffix  # Full ticker with suffix
+
+                # Validate ticker exists in yfinance by fetching prices
+                dict_validation: Dict[str, Any] = validate_ticker_and_fetch_prices(
+                    s_full_ticker,
+                    s_start_date,
+                    s_end_date
+                )  # Validation result with cached prices
+
+                if dict_validation.get("b_valid", False):
+                    # Return API result with cached prices
+                    return {
+                        "ticker": s_ticker_sanitised,
+                        "exchCode": s_exchange_code,
+                        "name": s_result_name,
+                        "s_full_ticker": s_full_ticker,
+                        "n_start_price": dict_validation.get("n_start_price"),
+                        "n_end_price": dict_validation.get("n_end_price"),
+                        "s_currency": dict_validation.get("s_currency")
+                    }
+                # If validation failed, continue to next exchange in priority order
+
+    return None  # No valid result found
+
+
+def resolve_ticker_with_prices(s_stock_name: str, s_start_date: str, s_end_date: str) -> Dict[str, Any]:
+    """
+    Resolve a stock ticker using OpenFIGI Search API and validate with yfinance.
+
+    Uses exchange priority algorithm to select the best result. Each candidate
+    ticker is validated against yfinance by fetching price data. If valid,
+    the prices are cached in the result to avoid duplicate API calls later.
+
+    Args:
+        s_stock_name: Company name to search.
+        s_start_date: Start date string in dd-mmm-yy format.
+        s_end_date: End date string in dd-mmm-yy format.
+
+    Returns:
+        Dictionary containing:
+            - s_ticker: Stock ticker symbol (empty if not found)
+            - s_exchange_code: Exchange code (empty if not found)
+            - s_full_ticker: Full ticker with exchange suffix (empty if not found)
+            - b_not_found: True if stock was not found
+            - n_start_price: Cached start price (if valid)
+            - n_end_price: Cached end price (if valid)
+            - s_currency: Currency code (if valid)
+
+    Raises:
+        ApiError: If API is unreachable or returns an error.
+    """
+    dict_headers: Dict[str, str] = {"Content-Type": "application/json"}  # HTTP request headers
+    dict_query: Dict[str, str] = {"query": s_stock_name}  # Search query
+
+    try:
+        response_api = requests.post(OPENFIGI_SEARCH_URL, json=dict_query, headers=dict_headers, timeout=30)
+    except Exception as e:
+        raise ApiError(f"OpenFIGI API unreachable. Error: {str(e)}")
+
+    if response_api.status_code == 429:
+        # Extract rate limit headers for debugging
+        s_rate_limit: str = response_api.headers.get("ratelimit-limit", "unknown")  # Max requests allowed
+        s_rate_remaining: str = response_api.headers.get("ratelimit-remaining", "unknown")  # Requests remaining
+        s_rate_reset: str = response_api.headers.get("ratelimit-reset", "unknown")  # Seconds until reset
+        s_error_message: str = (
+            f"OpenFIGI Search API rate limit exceeded.\n"
+            f"  Endpoint: {OPENFIGI_SEARCH_URL}\n"
+            f"  Rate Limit: {s_rate_limit} requests\n"
+            f"  Remaining: {s_rate_remaining}\n"
+            f"  Reset in: {s_rate_reset} seconds\n"
+            f"Please wait and try again."
+        )
+        raise ApiError(s_error_message)
+
+    if response_api.status_code != 200:
+        raise ApiError(f"OpenFIGI API returned error status: {response_api.status_code}")
+
+    dict_response: Dict[str, Any] = response_api.json()  # API response data
+
+    # Check for no results from API
+    if "data" not in dict_response or len(dict_response.get("data", [])) == 0:
+        return {"s_ticker": "", "s_exchange_code": "", "s_full_ticker": "", "b_not_found": True}
+
+    list_dict_api_results: List[Dict[str, Any]] = dict_response["data"]  # All results from API
+
+    # Select best result using exchange priority algorithm with yfinance validation
+    dict_best_result: Optional[Dict[str, Any]] = select_and_validate_best_result(
+        list_dict_api_results,
+        s_stock_name,
+        s_start_date,
+        s_end_date
+    )  # Best matching result after filtering and validation
+
+    # If no valid result found, return not found (no fallback)
+    if dict_best_result is None:
+        return {"s_ticker": "", "s_exchange_code": "", "s_full_ticker": "", "b_not_found": True}
+
+    s_ticker: str = dict_best_result.get("ticker", "")  # Sanitised ticker symbol
+    s_exchange_code: str = dict_best_result.get("exchCode", "")  # Exchange code
+    s_full_ticker: str = dict_best_result.get("s_full_ticker", "")  # Full ticker with suffix
+
+    return {
+        "s_ticker": s_ticker,
+        "s_exchange_code": s_exchange_code,
+        "s_full_ticker": s_full_ticker,
+        "b_not_found": False,
+        "n_start_price": dict_best_result.get("n_start_price"),
+        "n_end_price": dict_best_result.get("n_end_price"),
+        "s_currency": dict_best_result.get("s_currency")
+    }
+
+
+def resolve_tickers_batch_with_prices(
+    list_dict_stocks: List[Dict[str, str]],
+    s_start_date: str,
+    s_end_date: str
+) -> List[Dict[str, Any]]:
+    """
+    Resolve multiple stock tickers using Bloomberg OpenFIGI API and validate with yfinance.
+
+    Uses the Mapping API (with batching) for ISIN lookups and the Search API for name lookups.
+    The Search API does not support batching, so name lookups are done one at a time with delays.
+    All resolved tickers are validated against yfinance, and prices are cached.
+
+    Args:
+        list_dict_stocks: List of stock dictionaries with s_name, s_ticker, s_isin keys.
+                          Only stocks without a ticker will be looked up.
+        s_start_date: Start date string in dd-mmm-yy format.
+        s_end_date: End date string in dd-mmm-yy format.
+
+    Returns:
+        List of result dictionaries in the same order as input, each containing:
+            - s_ticker: Stock ticker symbol (empty if not found)
+            - s_exchange_code: Exchange code (empty if not found)
+            - s_full_ticker: Full ticker with exchange suffix (empty if not found)
+            - b_not_found: True if stock was not found
+            - b_skipped: True if stock already had a ticker (no lookup needed)
+            - n_start_price: Cached start price (if valid)
+            - n_end_price: Cached end price (if valid)
+            - s_currency: Currency code (if valid)
+
+    Raises:
+        ApiError: If API is unreachable or returns an error.
+    """
+    list_dict_results: List[Dict[str, Any]] = []  # Results for all stocks
+    list_n_isin_indices: List[int] = []  # Indices of stocks with ISINs (can be batched)
+    list_dict_isin_stocks: List[Dict[str, str]] = []  # Stocks with ISINs
+    list_n_name_indices: List[int] = []  # Indices of stocks with only names (cannot be batched)
+    list_dict_name_stocks: List[Dict[str, str]] = []  # Stocks with only names
+
+    # Categorize stocks
+    for n_index, dict_stock in enumerate(list_dict_stocks):
+        s_ticker: str = dict_stock.get("s_ticker", "")  # Existing ticker
+        s_isin: str = dict_stock.get("s_isin", "")  # Stock ISIN
+
+        if s_ticker:
+            # Stock already has ticker, skip lookup (prices will be fetched later in process_stock)
+            list_dict_results.append({
+                "s_ticker": s_ticker,
+                "s_exchange_code": "",
+                "s_full_ticker": "",
+                "b_not_found": False,
+                "b_skipped": True,
+                "n_start_price": None,
+                "n_end_price": None,
+                "s_currency": None
+            })
+        elif s_isin:
+            # Stock has ISIN, can be batched via Mapping API
+            list_dict_results.append(None)  # Placeholder
+            list_n_isin_indices.append(n_index)
+            list_dict_isin_stocks.append(dict_stock)
+        else:
+            # Stock has only name, use Search API (no batching)
+            list_dict_results.append(None)  # Placeholder
+            list_n_name_indices.append(n_index)
+            list_dict_name_stocks.append(dict_stock)
+
+    n_isin_count: int = len(list_dict_isin_stocks)  # Number of ISIN lookups
+    n_name_count: int = len(list_dict_name_stocks)  # Number of name lookups
+
+    # If no stocks need lookup, return early
+    if n_isin_count == 0 and n_name_count == 0:
+        return list_dict_results
+
+    print(f"Looking up {n_isin_count + n_name_count} stock tickers ({n_isin_count} by ISIN, {n_name_count} by name)...")
+
+    # Process ISIN lookups using Mapping API with batching
+    if n_isin_count > 0:
+        n_isin_batch_count: int = math.ceil(n_isin_count / OPENFIGI_BATCH_SIZE)  # Number of ISIN batches
+
+        for n_batch_index in range(n_isin_batch_count):
+            n_start_index: int = n_batch_index * OPENFIGI_BATCH_SIZE  # Start index for this batch
+            n_end_index: int = min(n_start_index + OPENFIGI_BATCH_SIZE, n_isin_count)  # End index for this batch
+
+            # Build query for this batch
+            list_dict_api_query: List[Dict[str, str]] = []  # Query payload for OpenFIGI API
+
+            for n_stock_index in range(n_start_index, n_end_index):
+                dict_stock: Dict[str, str] = list_dict_isin_stocks[n_stock_index]  # Current stock
+                s_isin: str = dict_stock.get("s_isin", "")  # Stock ISIN
+                dict_query: Dict[str, str] = {"idType": "ID_ISIN", "idValue": s_isin}
+                list_dict_api_query.append(dict_query)
+
+            # Make API request
+            dict_headers: Dict[str, str] = {"Content-Type": "application/json"}  # HTTP request headers
+
+            try:
+                response_api = requests.post(OPENFIGI_MAPPING_URL, json=list_dict_api_query, headers=dict_headers, timeout=30)
+            except Exception as e:
+                raise ApiError(f"OpenFIGI API unreachable. Error: {str(e)}")
+
+            if response_api.status_code == 429:
+                # Extract rate limit headers for debugging
+                s_rate_limit: str = response_api.headers.get("ratelimit-limit", "unknown")  # Max requests allowed
+                s_rate_remaining: str = response_api.headers.get("ratelimit-remaining", "unknown")  # Requests remaining
+                s_rate_reset: str = response_api.headers.get("ratelimit-reset", "unknown")  # Seconds until reset
+                s_error_message: str = (
+                    f"OpenFIGI Mapping API rate limit exceeded.\n"
+                    f"  Endpoint: {OPENFIGI_MAPPING_URL}\n"
+                    f"  Rate Limit: {s_rate_limit} requests\n"
+                    f"  Remaining: {s_rate_remaining}\n"
+                    f"  Reset in: {s_rate_reset} seconds\n"
+                    f"Please wait and try again."
+                )
+                raise ApiError(s_error_message)
+
+            if response_api.status_code != 200:
+                raise ApiError(f"OpenFIGI API returned error status: {response_api.status_code}")
+
+            list_dict_response: List[Dict[str, Any]] = response_api.json()  # API response data
+
+            # Parse response and update results
+            for n_response_index, dict_response in enumerate(list_dict_response):
+                n_original_index: int = list_n_isin_indices[n_start_index + n_response_index]  # Original index in input list
+
+                # Check for no match or error
+                if "warning" in dict_response or "error" in dict_response or "data" not in dict_response or len(dict_response.get("data", [])) == 0:
+                    list_dict_results[n_original_index] = {
+                        "s_ticker": "",
+                        "s_exchange_code": "",
+                        "s_full_ticker": "",
+                        "b_not_found": True,
+                        "b_skipped": False,
+                        "n_start_price": None,
+                        "n_end_price": None,
+                        "s_currency": None
+                    }
+                else:
+                    dict_first_result: Dict[str, Any] = dict_response["data"][0]  # First matching result
+                    s_ticker_raw: str = dict_first_result.get("ticker", "")  # Raw ticker symbol from API
+                    s_ticker: str = sanitise_ticker(s_ticker_raw)  # Sanitised ticker symbol
+                    s_exchange_code: str = dict_first_result.get("exchCode", "")  # Exchange code
+                    s_exchange_suffix: str = map_exchange_to_suffix(s_exchange_code)  # Exchange suffix for yfinance
+                    s_full_ticker: str = s_ticker + s_exchange_suffix  # Full ticker with suffix
+
+                    # Validate ticker with yfinance and get cached prices
+                    dict_validation: Dict[str, Any] = validate_ticker_and_fetch_prices(
+                        s_full_ticker,
+                        s_start_date,
+                        s_end_date
+                    )
+
+                    if dict_validation.get("b_valid", False):
+                        list_dict_results[n_original_index] = {
+                            "s_ticker": s_ticker,
+                            "s_exchange_code": s_exchange_code,
+                            "s_full_ticker": s_full_ticker,
+                            "b_not_found": False,
+                            "b_skipped": False,
+                            "n_start_price": dict_validation.get("n_start_price"),
+                            "n_end_price": dict_validation.get("n_end_price"),
+                            "s_currency": dict_validation.get("s_currency")
+                        }
+                    else:
+                        # Ticker not valid in yfinance, mark as not found
+                        list_dict_results[n_original_index] = {
+                            "s_ticker": "",
+                            "s_exchange_code": "",
+                            "s_full_ticker": "",
+                            "b_not_found": True,
+                            "b_skipped": False,
+                            "n_start_price": None,
+                            "n_end_price": None,
+                            "s_currency": None
+                        }
+
+            print(f"  ISIN batch {n_batch_index + 1}/{n_isin_batch_count} complete ({n_end_index - n_start_index} stocks)")
+
+            # Add delay between batches (Mapping API: 25 req/min)
+            if n_batch_index < n_isin_batch_count - 1 or n_name_count > 0:
+                time.sleep(OPENFIGI_MAPPING_DELAY_SECONDS)
+
+    # Process name lookups using Search API (one at a time)
+    if n_name_count > 0:
+        # Calculate estimated time for user feedback
+        n_estimated_minutes: int = (n_name_count * int(OPENFIGI_SEARCH_DELAY_SECONDS)) // 60  # Estimated minutes
+        print(f"  Note: Name lookups are rate-limited to 5/min. Estimated time: ~{n_estimated_minutes} minutes")
+
+        for n_name_index, dict_stock in enumerate(list_dict_name_stocks):
+            s_name: str = dict_stock.get("s_name", "")  # Stock name
+            n_original_index: int = list_n_name_indices[n_name_index]  # Original index in input list
+
+            dict_lookup_result: Dict[str, Any] = resolve_ticker_with_prices(s_name, s_start_date, s_end_date)
+
+            list_dict_results[n_original_index] = {
+                "s_ticker": dict_lookup_result.get("s_ticker", ""),
+                "s_exchange_code": dict_lookup_result.get("s_exchange_code", ""),
+                "s_full_ticker": dict_lookup_result.get("s_full_ticker", ""),
+                "b_not_found": dict_lookup_result.get("b_not_found", True),
+                "b_skipped": False,
+                "n_start_price": dict_lookup_result.get("n_start_price"),
+                "n_end_price": dict_lookup_result.get("n_end_price"),
+                "s_currency": dict_lookup_result.get("s_currency")
+            }
+
+            # Progress update every 5 stocks (more frequent due to longer delays)
+            if (n_name_index + 1) % 5 == 0 or n_name_index == n_name_count - 1:
+                print(f"  Name lookup {n_name_index + 1}/{n_name_count} complete")
+
+            # Add delay between requests (Search API: 5 req/min)
+            if n_name_index < n_name_count - 1:
+                time.sleep(OPENFIGI_SEARCH_DELAY_SECONDS)
+
+    return list_dict_results
+
+
+def resolve_all_tickers(
+    list_dict_stocks: List[Dict[str, str]],
+    s_start_date: str,
+    s_end_date: str
+) -> List[Dict[str, Any]]:
+    """
+    Resolve tickers for all stocks using batch OpenFIGI lookup with yfinance validation.
+
+    This function looks up tickers for stocks that don't have one provided,
+    validates them against yfinance, applies exchange suffixes, and caches
+    price data to avoid duplicate API calls.
+
+    Args:
+        list_dict_stocks: List of stock dictionaries with s_name, s_ticker, s_isin keys.
+        s_start_date: Start date string in dd-mmm-yy format.
+        s_end_date: End date string in dd-mmm-yy format.
+
+    Returns:
+        Updated list of stock dictionaries with resolved tickers and cached prices.
+
+    Raises:
+        ApiError: If OpenFIGI API is unreachable or returns an error.
+    """
+    # Perform batch lookup with yfinance validation
+    list_dict_lookup_results: List[Dict[str, Any]] = resolve_tickers_batch_with_prices(
+        list_dict_stocks,
+        s_start_date,
+        s_end_date
+    )
+
+    # Update stock dictionaries with lookup results
+    for n_index, dict_lookup_result in enumerate(list_dict_lookup_results):
+        if dict_lookup_result.get("b_skipped", False):
+            # Stock already had ticker, no changes needed (prices will be fetched later)
+            continue
+
+        if dict_lookup_result.get("b_not_found", False):
+            # Stock not found, leave ticker empty (will be handled later as error)
+            list_dict_stocks[n_index]["s_ticker"] = ""
+            list_dict_stocks[n_index]["b_not_found"] = True
+        else:
+            # Use the full ticker already validated and constructed
+            s_full_ticker: str = dict_lookup_result.get("s_full_ticker", "")  # Full ticker with suffix
+
+            list_dict_stocks[n_index]["s_ticker"] = s_full_ticker
+            list_dict_stocks[n_index]["b_not_found"] = False
+
+            # Store cached prices to avoid re-fetching later
+            list_dict_stocks[n_index]["n_start_price"] = dict_lookup_result.get("n_start_price")
+            list_dict_stocks[n_index]["n_end_price"] = dict_lookup_result.get("n_end_price")
+            list_dict_stocks[n_index]["s_currency"] = dict_lookup_result.get("s_currency")
+
+    return list_dict_stocks
 
 
 # Exchange Suffix Mapping Functions
@@ -405,6 +919,75 @@ def generate_output_filename(s_output_directory_path: str) -> str:
 
 
 # Stock Data Fetching Functions
+
+def validate_ticker_and_fetch_prices(s_ticker: str, s_start_date: str, s_end_date: str) -> Dict[str, Any]:
+    """
+    Validate a ticker exists in yfinance by attempting to fetch price data.
+
+    This function serves dual purpose:
+    1. Validates that a ticker is recognised by yfinance
+    2. Fetches and caches price data to avoid duplicate API calls later
+
+    Args:
+        s_ticker: Stock ticker symbol (including exchange suffix if needed).
+        s_start_date: Start date string in dd-mmm-yy format.
+        s_end_date: End date string in dd-mmm-yy format.
+
+    Returns:
+        Dictionary containing:
+            - b_valid: True if ticker has price data, False otherwise
+            - n_start_price: Start closing price (if valid)
+            - n_end_price: End closing price (if valid)
+            - s_currency: Currency code (if valid)
+    """
+    try:
+        # Adjust dates to trading days (skip weekends)
+        s_adjusted_start_date: str = adjust_to_trading_day(s_start_date)  # Adjusted start date
+        s_adjusted_end_date: str = adjust_to_trading_day(s_end_date)  # Adjusted end date
+
+        # Parse dates for yfinance
+        dt_start: datetime = datetime.strptime(s_adjusted_start_date, DATE_FORMAT)  # Parsed start date
+        dt_start_end: datetime = dt_start + timedelta(days=5)  # End of start date range (covers holidays)
+        dt_end: datetime = datetime.strptime(s_adjusted_end_date, DATE_FORMAT)  # Parsed end date
+        dt_end_end: datetime = dt_end + timedelta(days=5)  # End of end date range (covers holidays)
+
+        s_yf_start_begin: str = dt_start.strftime("%Y-%m-%d")  # yfinance format for start date begin
+        s_yf_start_end: str = dt_start_end.strftime("%Y-%m-%d")  # yfinance format for start date end
+        s_yf_end_begin: str = dt_end.strftime("%Y-%m-%d")  # yfinance format for end date begin
+        s_yf_end_end: str = dt_end_end.strftime("%Y-%m-%d")  # yfinance format for end date end
+
+        # Create yfinance ticker object
+        ticker_stock = yfinance.Ticker(s_ticker)  # yfinance Ticker object
+
+        # Fetch start price
+        df_start_history = ticker_stock.history(start=s_yf_start_begin, end=s_yf_start_end)  # Start date price history
+        if df_start_history.empty:
+            return {"b_valid": False}
+
+        n_start_price: float = df_start_history["Close"].iloc[0]  # First available closing price for start
+
+        # Fetch end price
+        df_end_history = ticker_stock.history(start=s_yf_end_begin, end=s_yf_end_end)  # End date price history
+        if df_end_history.empty:
+            return {"b_valid": False}
+
+        n_end_price: float = df_end_history["Close"].iloc[0]  # First available closing price for end
+
+        # Fetch currency
+        dict_info: Dict[str, Any] = ticker_stock.info  # Stock info dictionary
+        s_currency: str = dict_info.get("currency", "N/A")  # Currency code
+
+        return {
+            "b_valid": True,
+            "n_start_price": round(n_start_price, 2),
+            "n_end_price": round(n_end_price, 2),
+            "s_currency": s_currency
+        }
+
+    except Exception:
+        # Any error means ticker is invalid or has no data
+        return {"b_valid": False}
+
 
 def fetch_stock_price(s_ticker: str, s_date: str) -> float:
     """
@@ -552,12 +1135,16 @@ def print_output_terminal(s_start_date: str, s_end_date: str, list_dict_results:
 
 # Main Processing Functions
 
-def process_stock(dict_stock: Dict[str, str], s_start_date: str, s_end_date: str) -> Tuple[Dict[str, Any], List[str]]:
+def process_stock(dict_stock: Dict[str, Any], s_start_date: str, s_end_date: str) -> Tuple[Dict[str, Any], List[str]]:
     """
     Process a single stock and calculate percentage change.
 
+    Expects ticker to be pre-resolved via resolve_all_tickers() before calling this function.
+    If prices were cached during ticker resolution, they will be used directly.
+    Otherwise, prices will be fetched from yfinance.
+
     Args:
-        dict_stock: Stock dictionary with name, ticker, isin.
+        dict_stock: Stock dictionary with name, ticker, isin, optional cached prices, and optional b_not_found flag.
         s_start_date: Start date string.
         s_end_date: End date string.
 
@@ -565,31 +1152,42 @@ def process_stock(dict_stock: Dict[str, str], s_start_date: str, s_end_date: str
         Tuple of (result dictionary, list of date adjustment notes).
     """
     s_name: str = dict_stock.get("s_name", "")  # Stock name
-    s_ticker: str = dict_stock.get("s_ticker", "")  # Stock ticker
+    s_ticker: str = dict_stock.get("s_ticker", "")  # Stock ticker (pre-resolved)
     s_isin: str = dict_stock.get("s_isin", "")  # Stock ISIN
+    b_not_found: bool = dict_stock.get("b_not_found", False)  # Flag indicating ticker lookup failed
     list_s_date_adjustment_notes: List[str] = []  # Date adjustment notes for this stock
 
-    dict_result: Dict[str, Any] = {"s_name": s_name, "s_ticker": "", "s_isin": s_isin, "n_start_price": None, "n_end_price": None, "n_percentage": None, "s_currency": "", "s_error": ""}
+    # Check for cached prices from ticker resolution
+    n_cached_start_price: Optional[float] = dict_stock.get("n_start_price")  # Cached start price
+    n_cached_end_price: Optional[float] = dict_stock.get("n_end_price")  # Cached end price
+    s_cached_currency: Optional[str] = dict_stock.get("s_currency")  # Cached currency
 
-    # Resolve ticker if not provided
-    if not s_ticker:
-        try:
-            dict_lookup: Dict[str, Any] = lookup_ticker_from_openfigi(s_stock_name=s_name, s_isin=s_isin)
+    dict_result: Dict[str, Any] = {"s_name": s_name, "s_ticker": s_ticker, "s_isin": s_isin, "n_start_price": None, "n_end_price": None, "n_percentage": None, "s_currency": "", "s_error": ""}
 
-            if dict_lookup.get("b_not_found", False):
-                dict_result["s_error"] = "Stock details not found"
-                return dict_result, list_s_date_adjustment_notes
+    # Check if ticker lookup failed
+    if b_not_found or not s_ticker:
+        dict_result["s_error"] = "Stock details not found"
+        return dict_result, list_s_date_adjustment_notes
 
-            s_ticker = dict_lookup.get("s_ticker", "")
-            s_exchange_code: str = dict_lookup.get("s_exchange_code", "")  # Exchange code from OpenFIGI
-            s_suffix: str = map_exchange_to_suffix(s_exchange_code)  # yfinance suffix for exchange
-            s_ticker = s_ticker + s_suffix
+    # Check if we have cached prices from ticker resolution
+    if n_cached_start_price is not None and n_cached_end_price is not None and s_cached_currency is not None:
+        # Use cached prices - no need to fetch again
+        n_start_price: float = n_cached_start_price
+        n_end_price: float = n_cached_end_price
+        s_currency: str = s_cached_currency
 
-        except ApiError as e:
-            raise e
+        # Calculate percentage change
+        n_percentage: float = calculate_percentage_change(n_start_price, n_end_price)
 
-    dict_result["s_ticker"] = s_ticker
+        # Update result
+        dict_result["n_start_price"] = round(n_start_price, 2)
+        dict_result["n_end_price"] = round(n_end_price, 2)
+        dict_result["n_percentage"] = round(n_percentage, 2)
+        dict_result["s_currency"] = s_currency
 
+        return dict_result, list_s_date_adjustment_notes
+
+    # No cached prices - fetch from yfinance (for user-provided tickers)
     # Adjust dates to trading days
     s_adjusted_start_date: str
     b_start_adjusted: bool
@@ -607,23 +1205,23 @@ def process_stock(dict_stock: Dict[str, str], s_start_date: str, s_end_date: str
 
     # Fetch stock prices
     try:
-        n_start_price: float = fetch_stock_price(s_ticker, s_adjusted_start_date)
-        n_end_price: float = fetch_stock_price(s_ticker, s_adjusted_end_date)
+        n_start_price_fetched: float = fetch_stock_price(s_ticker, s_adjusted_start_date)
+        n_end_price_fetched: float = fetch_stock_price(s_ticker, s_adjusted_end_date)
     except StockDelistedError:
         dict_result["s_error"] = "Delisted"
         return dict_result, list_s_date_adjustment_notes
 
     # Calculate percentage change
-    n_percentage: float = calculate_percentage_change(n_start_price, n_end_price)
+    n_percentage_calc: float = calculate_percentage_change(n_start_price_fetched, n_end_price_fetched)
 
     # Fetch currency
-    s_currency: str = fetch_stock_currency(s_ticker)
+    s_currency_fetched: str = fetch_stock_currency(s_ticker)
 
     # Update result
-    dict_result["n_start_price"] = round(n_start_price, 2)
-    dict_result["n_end_price"] = round(n_end_price, 2)
-    dict_result["n_percentage"] = round(n_percentage, 2)
-    dict_result["s_currency"] = s_currency
+    dict_result["n_start_price"] = round(n_start_price_fetched, 2)
+    dict_result["n_end_price"] = round(n_end_price_fetched, 2)
+    dict_result["n_percentage"] = round(n_percentage_calc, 2)
+    dict_result["s_currency"] = s_currency_fetched
 
     return dict_result, list_s_date_adjustment_notes
 
@@ -677,23 +1275,27 @@ def main() -> None:
             dict_stock: Dict[str, str] = {"s_name": s_stock_name, "s_ticker": "", "s_isin": ""}
             list_dict_stocks.append(dict_stock)
 
+    # Resolve all tickers using batch OpenFIGI lookup with yfinance validation
+    try:
+        list_dict_stocks = resolve_all_tickers(list_dict_stocks, s_start_date, s_end_date)
+    except ApiError as e:
+        print(f"Error: {str(e)}")
+        sys.exit(1)
+
     # Process each stock
     list_dict_results: List[Dict[str, Any]] = []  # Results for all stocks
     list_s_all_date_adjustment_notes: List[str] = []  # All date adjustment notes
 
+    print("Fetching stock prices...")
+
     # Loop through each stock to process
     for dict_stock in list_dict_stocks:
-        try:
-            dict_result: Dict[str, Any]
-            list_s_date_adjustment_notes: List[str]
-            dict_result, list_s_date_adjustment_notes = process_stock(dict_stock, s_start_date, s_end_date)
+        dict_result: Dict[str, Any]
+        list_s_date_adjustment_notes: List[str]
+        dict_result, list_s_date_adjustment_notes = process_stock(dict_stock, s_start_date, s_end_date)
 
-            list_dict_results.append(dict_result)
-            list_s_all_date_adjustment_notes.extend(list_s_date_adjustment_notes)
-
-        except ApiError as e:
-            print(f"Error: {str(e)}")
-            sys.exit(1)
+        list_dict_results.append(dict_result)
+        list_s_all_date_adjustment_notes.extend(list_s_date_adjustment_notes)
 
     # Generate output filename
     s_output_file_path: str = generate_output_filename(s_output_directory_path)

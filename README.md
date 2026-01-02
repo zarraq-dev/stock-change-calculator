@@ -15,7 +15,7 @@ A Python command-line tool that calculates the percentage price movement of stoc
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/stock-change-calculator.git
+git clone https://github.com/zarraq-dev/stock-change-calculator.git
 cd stock-change-calculator
 ```
 
@@ -122,6 +122,39 @@ If a file with that name already exists, the program creates a versioned file:
 | Date is weekend/holiday | Adjusts to next trading day, note displayed |
 | API unreachable | Displays error message and exits |
 | Invalid input file | Displays specific error message |
+
+## Ticker Resolution
+
+When you provide a company name without a ticker, the tool uses the Bloomberg OpenFIGI API to find the correct ticker symbol. The resolution logic works as follows:
+
+### Supported Security Types
+
+The tool only resolves to tradeable equity securities:
+- **Common Stock** - Standard company shares
+- **REIT** - Real Estate Investment Trusts
+- **ETP** - Exchange Traded Products (ETFs)
+
+### Exchange Priority
+
+When multiple listings exist for the same company, the tool prioritises exchanges in this order:
+
+1. **UK** - London Stock Exchange (LN)
+2. **US** - NYSE, NASDAQ (US, UN, UQ, UM)
+3. **Canada** - Toronto (CN, CT)
+4. **Germany** - Frankfurt, XETRA (GF, GR, GY)
+5. **Netherlands** - Amsterdam/Euronext (NA)
+
+For example, Shell PLC will resolve to `SHEL.L` (London) rather than the Amsterdam or other listings.
+
+## Rate Limiting
+
+This tool uses the Bloomberg OpenFIGI API to resolve company names to ticker symbols. The free tier has these limits:
+- **Name lookups:** 5 requests per minute (12 second delay between requests)
+- **ISIN lookups:** 25 requests per minute (batched, faster)
+
+If you have ISINs available, provide them in your input file for faster processing.
+
+**Planned Feature:** A future version will accept an OpenFIGI API key for users with registered accounts, enabling higher rate limits.
 
 ## Dependencies
 

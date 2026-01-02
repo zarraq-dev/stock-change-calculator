@@ -252,7 +252,7 @@ class TestOpenFigiLookup:
 
     @patch('src.stock_calculator.requests.post')
     def test_lookup_ticker_by_name_success(self, mock_post: Mock) -> None:
-        """Test successful ticker lookup using company name."""
+        """Test successful ticker lookup using company name via Search API."""
         from src.stock_calculator import lookup_ticker_from_openfigi
 
         # Arrange
@@ -260,17 +260,16 @@ class TestOpenFigiLookup:
 
         mock_response: Mock = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = [
-            {
-                'data': [
-                    {
-                        'ticker': 'AAPL',
-                        'exchCode': 'US',
-                        'name': 'APPLE INC'
-                    }
-                ]
-            }
-        ]
+        # Search API returns a dict with 'data' key directly (not a list)
+        mock_response.json.return_value = {
+            'data': [
+                {
+                    'ticker': 'AAPL',
+                    'exchCode': 'US',
+                    'name': 'APPLE INC'
+                }
+            ]
+        }
         mock_post.return_value = mock_response
 
         # Act
@@ -358,17 +357,16 @@ class TestOpenFigiLookup:
 
         mock_response: Mock = Mock()
         mock_response.status_code = 200
-        mock_response.json.return_value = [
-            {
-                'data': [
-                    {
-                        'ticker': 'NG',
-                        'exchCode': 'LN',
-                        'name': 'NATIONAL GRID PLC'
-                    }
-                ]
-            }
-        ]
+        # Search API returns dict with 'data' key (not list like Mapping API)
+        mock_response.json.return_value = {
+            'data': [
+                {
+                    'ticker': 'NG',
+                    'exchCode': 'LN',
+                    'name': 'NATIONAL GRID PLC'
+                }
+            ]
+        }
         mock_post.return_value = mock_response
 
         # Act
@@ -733,3 +731,606 @@ class TestStockDataFetching:
 
         # Assert
         assert s_currency == 'USD'
+
+
+# Exchange Priority Result Selection Tests
+
+class TestSelectAndValidateBestResult:
+    """Tests for select_and_validate_best_result() exchange priority algorithm with yfinance validation."""
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_prioritizes_uk_over_us_exchange(self, mock_validate: MagicMock) -> None:
+        """Test that UK exchange (LN) is prioritized over US exchanges."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "GBP"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'MSFT',
+                'exchCode': 'US',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'MICROSOFT CORP'
+            },
+            {
+                'ticker': 'MSFT',
+                'exchCode': 'LN',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'MICROSOFT CORP'
+            }
+        ]
+        s_query: str = 'Microsoft Corp'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result['exchCode'] == 'LN'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_prioritizes_us_over_germany_exchange(self, mock_validate: MagicMock) -> None:
+        """Test that US exchange is prioritized over German exchanges."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "USD"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'AAPL',
+                'exchCode': 'GF',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'APPLE INC'
+            },
+            {
+                'ticker': 'AAPL',
+                'exchCode': 'US',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'APPLE INC'
+            }
+        ]
+        s_query: str = 'Apple Inc'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result['exchCode'] == 'US'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_skips_result_with_invalid_security_type(self, mock_validate: MagicMock) -> None:
+        """Test that results with invalid security types are skipped."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "USD"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'AAPL-OPT',
+                'exchCode': 'LN',
+                'securityType': 'Option',
+                'securityType2': 'Option',
+                'name': 'APPLE INC OPTION'
+            },
+            {
+                'ticker': 'AAPL',
+                'exchCode': 'US',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'APPLE INC'
+            }
+        ]
+        s_query: str = 'Apple Inc'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert - should skip the LN option and return US common stock
+        assert dict_result['ticker'] == 'AAPL'
+        assert dict_result['exchCode'] == 'US'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_skips_result_with_unsupported_exchange(self, mock_validate: MagicMock) -> None:
+        """Test that results with unsupported exchange codes are skipped."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "GBP"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'SHEL',
+                'exchCode': 'XS',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            },
+            {
+                'ticker': 'SHEL',
+                'exchCode': 'LN',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            }
+        ]
+        s_query: str = 'Shell PLC'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert - should skip XS and return LN
+        assert dict_result['exchCode'] == 'LN'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_skips_result_where_query_not_in_name(self, mock_validate: MagicMock) -> None:
+        """Test that results where search query is not in name are skipped."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "GBP"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'HANKOOK',
+                'exchCode': 'LN',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'HANKOOK SHELL OIL CO LTD'
+            },
+            {
+                'ticker': 'SHEL',
+                'exchCode': 'LN',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            }
+        ]
+        s_query: str = 'Shell PLC'  # Search query - "Shell PLC" is not in "HANKOOK SHELL OIL CO LTD"
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert - should skip HANKOOK and return SHELL PLC
+        assert dict_result['ticker'] == 'SHEL'
+        assert dict_result['name'] == 'SHELL PLC'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_accepts_common_stock_security_type(self, mock_validate: MagicMock) -> None:
+        """Test that Common Stock security type is accepted."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "USD"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'AAPL',
+                'exchCode': 'US',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'APPLE INC'
+            }
+        ]
+        s_query: str = 'Apple Inc'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result is not None
+        assert dict_result['ticker'] == 'AAPL'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_accepts_reit_security_type(self, mock_validate: MagicMock) -> None:
+        """Test that REIT security type is accepted."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "USD"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'SPG',
+                'exchCode': 'US',
+                'securityType': 'REIT',
+                'securityType2': 'REIT',
+                'name': 'SIMON PROPERTY GROUP INC'
+            }
+        ]
+        s_query: str = 'Simon Property Group Inc'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result is not None
+        assert dict_result['ticker'] == 'SPG'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_accepts_etp_security_type(self, mock_validate: MagicMock) -> None:
+        """Test that ETP security type is accepted."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "USD"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'SPY',
+                'exchCode': 'US',
+                'securityType': 'ETP',
+                'securityType2': 'ETP',
+                'name': 'SPDR S&P 500 ETF TRUST'
+            }
+        ]
+        s_query: str = 'SPDR S&P 500 ETF'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result is not None
+        assert dict_result['ticker'] == 'SPY'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_checks_security_type2_field(self, mock_validate: MagicMock) -> None:
+        """Test that securityType2 field is also checked for valid types."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "USD"
+        }
+
+        # Arrange - securityType is blank, but securityType2 has valid value
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'AAPL',
+                'exchCode': 'US',
+                'securityType': '',
+                'securityType2': 'Common Stock',
+                'name': 'APPLE INC'
+            }
+        ]
+        s_query: str = 'Apple Inc'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result is not None
+        assert dict_result['ticker'] == 'AAPL'
+
+    def test_returns_none_when_no_match_found(self) -> None:
+        """Test that None is returned when no results pass the filter (all unsupported exchanges)."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Arrange - all results have unsupported exchanges
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'TEST',
+                'exchCode': 'XX',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'TEST COMPANY'
+            },
+            {
+                'ticker': 'TEST2',
+                'exchCode': 'YY',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'TEST COMPANY TWO'
+            }
+        ]
+        s_query: str = 'Test Company'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result is None
+
+    def test_returns_none_for_empty_list(self) -> None:
+        """Test that None is returned for empty result list."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = []  # Empty list
+        s_query: str = 'Apple Inc'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result is None
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_case_insensitive_name_matching(self, mock_validate: MagicMock) -> None:
+        """Test that name matching is case insensitive."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "GBP"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'SHEL',
+                'exchCode': 'LN',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            }
+        ]
+        s_query: str = 'shell plc'  # Lowercase search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result is not None
+        assert dict_result['ticker'] == 'SHEL'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_partial_name_matching(self, mock_validate: MagicMock) -> None:
+        """Test that partial name matching works (query substring of name)."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "GBP"
+        }
+
+        # Arrange
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'SHEL',
+                'exchCode': 'LN',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            }
+        ]
+        s_query: str = 'Shell'  # Partial query (just "Shell" not full "Shell PLC")
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert
+        assert dict_result is not None
+        assert dict_result['ticker'] == 'SHEL'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_shell_plc_returns_shel_on_ln(self, mock_validate: MagicMock) -> None:
+        """Test real-world scenario: Shell PLC should return SHEL on LN exchange."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "GBP"
+        }
+
+        # Arrange - simulate actual OpenFIGI results for Shell PLC
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'RDSBEUR',
+                'exchCode': 'XS',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            },
+            {
+                'ticker': 'RDSB',
+                'exchCode': 'SW',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            },
+            {
+                'ticker': 'SHEL',
+                'exchCode': 'LN',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            },
+            {
+                'ticker': 'SHELL',
+                'exchCode': 'NA',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'SHELL PLC'
+            }
+        ]
+        s_query: str = 'Shell PLC'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert - should return SHEL on LN (UK exchange has highest priority)
+        assert dict_result['ticker'] == 'SHEL'
+        assert dict_result['exchCode'] == 'LN'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_microsoft_returns_msft_on_us(self, mock_validate: MagicMock) -> None:
+        """Test real-world scenario: Microsoft Corp should return MSFT on US exchange."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "USD"
+        }
+
+        # Arrange - simulate actual OpenFIGI results for Microsoft
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'MSF',
+                'exchCode': 'GF',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'MICROSOFT CORP'
+            },
+            {
+                'ticker': 'MSFT',
+                'exchCode': 'US',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'MICROSOFT CORP'
+            },
+            {
+                'ticker': 'MSFT',
+                'exchCode': 'LN',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'MICROSOFT CORP'
+            }
+        ]
+        s_query: str = 'Microsoft Corp'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert - should return MSFT on LN (UK has highest priority, before US)
+        assert dict_result['ticker'] == 'MSFT'
+        assert dict_result['exchCode'] == 'LN'
+
+    @patch('src.stock_calculator.validate_ticker_and_fetch_prices')
+    def test_us_company_without_uk_listing_returns_us(self, mock_validate: MagicMock) -> None:
+        """Test that US company without UK listing returns US exchange."""
+        from src.stock_calculator import select_and_validate_best_result
+
+        # Mock yfinance validation to always return valid
+        mock_validate.return_value = {
+            "b_valid": True,
+            "n_start_price": 100.0,
+            "n_end_price": 110.0,
+            "s_currency": "USD"
+        }
+
+        # Arrange - no LN listing available
+        list_dict_results: List[Dict[str, Any]] = [
+            {
+                'ticker': 'MSF',
+                'exchCode': 'GF',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'MICROSOFT CORP'
+            },
+            {
+                'ticker': 'MSFT',
+                'exchCode': 'US',
+                'securityType': 'Common Stock',
+                'securityType2': 'Common Stock',
+                'name': 'MICROSOFT CORP'
+            }
+        ]
+        s_query: str = 'Microsoft Corp'  # Search query
+        s_start_date: str = '01-Oct-25'  # Start date
+        s_end_date: str = '01-Jan-26'  # End date
+
+        # Act
+        dict_result: Dict[str, Any] = select_and_validate_best_result(list_dict_results, s_query, s_start_date, s_end_date)
+
+        # Assert - should return MSFT on US (next priority after LN)
+        assert dict_result['ticker'] == 'MSFT'
+        assert dict_result['exchCode'] == 'US'
