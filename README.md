@@ -126,9 +126,9 @@ If a file with that name already exists, the program creates a versioned file:
 ## Dependencies
 
 - Python 3.8+
-- yfinance
-- requests
-- pandas
+- yfinance - Third-party library for fetching stock data from Yahoo Finance. Handles public holidays implicitly by returning data for the next available trading day.
+- requests - HTTP library for OpenFIGI API calls
+- pandas - Data manipulation library (used internally by yfinance)
 
 ## License
 
